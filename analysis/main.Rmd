@@ -1,0 +1,225 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r eval=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+# https://github.com/Bioconductor/bioconductor_docker/issues/22
+BiocManager::install("preprocessCore", configure.args="--disable-threading")
+```
+
+```{r load_libraries}
+library(tidyverse)
+library(preprocessCore)
+library(rstatix)
+library(future.apply)
+library(RColorBrewer)
+library(devtools)
+source_url("https://raw.githubusercontent.com/obigriffith/biostar-tutorials/master/Heatmaps/heatmap.3.R")
+```
+
+```{r read_data}
+sample_info <- read_tsv('raw/sample_info.tsv')
+
+zinc_raw <-
+  read_tsv(
+    'data/rnaseq-workflow/results/X204SC22093411-Z01-F002_gene-level-counts-annotated.tsv'
+  ) %>%
+  filter(`Gene stable ID` != 'ENSMUSG00000064351')  # max counts in each sample
+```
+
+```{r}
+sample_names_re = 'Zn[AD]_.*'
+
+zinc_raw_filtered <-
+  zinc_raw %>%
+  filter(rowMeans(across(matches(sample_names_re))) > 1)
+
+
+zinc_norm <-
+  zinc_raw_filtered %>%
+  select(matches(sample_names_re)) %>%
+  as.matrix() %>%
+  normalize.quantiles(keep.names = TRUE) %>%
+  {{ log2(. + 1) }}
+
+zinc_norm <-
+  zinc_raw_filtered %>%
+  transmute(
+    gene_stable_id = `Gene stable ID`,
+    gene_name = `Gene name`,
+  ) %>%
+  bind_cols(zinc_norm)
+```
+
+```{r to_package}
+pass <- function(.) {
+  .
+}
+
+compute_anova <- function(x, template, dv = 'value', wid = 'id', between = NULL, within = NULL) {
+  stopifnot('id' %in% colnames(sample_info))
+
+  template %>%
+    left_join(as_tibble(x, rownames = 'id'), by = 'id') %>%
+    anova_test(
+      dv = value,
+      wid = id,
+      between = all_of(between),
+      within = all_of(within)
+    ) %>%
+    get_anova_table() %>%
+    data.frame() %>%
+    select(Effect, p) %>%
+    pivot_wider(names_from = Effect, values_from = p)
+}
+
+compute_folds <- function(df, sample_info, sample_names_re, factors) {
+  stopifnot('id' %in% colnames(sample_info))
+
+  sample_info_grouped <-
+    sample_info %>%
+    group_by(across(all_of(factors)))
+  groups <-
+    sample_info_grouped %>%
+    group_split()
+  group_keys <-
+    sample_info_grouped %>%
+    group_keys() %>%
+    unite('name', everything(), remove = FALSE)
+
+  for (tb_idx in 1:length(groups)) {
+    tb <- groups[[tb_idx]]
+    tb_key <- group_keys[tb_idx, 'name'] %>% unlist()
+    df <-
+      df %>%
+      mutate(
+        "{tb_key}_mean" := apply(
+          select(., matches(sample_names_re)),
+          1,
+          function(x, names) {mean(x[names])},
+          names = tb$id
+        )
+      )
+  }
+  df
+}
+```
+
+```{r compute_anova}
+anova_rds_path <- 'data/zinc_anova.RDS'
+
+if (Sys.info()['sysname'] == 'Windows' | interactive() | Sys.getenv('RSTUDIO') == '1') {
+  plan(multisession)
+} else {
+  # docker exec -it <container_id_or_name>
+  # Rscript -e "
+  #   rmarkdown::render(
+  #     'analysis/main.Rmd',
+  #     knit_root_dir = xfun::proj_root(),
+  #     output_file = base::paste0(
+  #       xfun::sans_ext('main.Rmd'), '-',
+  #       base::format(Sys.time(), \"%Y-%m-%d_%H-%M\"), '.html'
+  #     )
+  #   )
+  # "
+  plan(multicore)
+}
+
+df_to_anova <- zinc_norm
+df_data <- df_to_anova %>% select(matches(sample_names_re))
+df_anno <- df_to_anova %>% select(-matches(sample_names_re))
+
+zinc_anova <- future_apply(
+  df_data ,
+  1,
+  compute_anova,
+  template = sample_info,
+  between = c('zinc', 'stress')
+)
+
+zinc_anova <-
+  bind_rows(zinc_anova) %>%
+
+  # adjust pvalue
+  mutate(
+    across(
+      .cols = everything(),
+      .fns = list(fdr = p.adjust),
+      method = 'fdr'
+    )
+  ) %>%
+
+  # bind annots
+  {{ bind_cols(df_anno, .) }} %>%
+
+  # bind counts
+  bind_cols(
+    df_data,
+  )
+```
+
+```{r compute_folds}
+zinc_anova <-
+  compute_folds(
+    zinc_anova,
+    sample_info,
+    sample_names_re,
+    factors = c('zinc', 'stress')
+  )
+```
+
+```{r save_anova_results}
+saveRDS(zinc_anova, anova_rds_path)
+```
+
+```{r eval=FALSE}
+zinc_anova <- readRDS(anova_rds_path)
+
+p_th <- 0.05
+fold_th <- 0
+way <- 'zinc:stress'
+way_fdr <- 'zinc:stress_fdr'
+
+plot_data <-
+  zinc_anova %>%
+  arrange(.data[[way]]) %>%
+  filter(.data[[way_fdr]] < p_th)
+```
+
+```{r draw_heatmap, echo=FALSE, fig.align="center", fig.height=10, fig.width=13, results='asis', include=TRUE, warning=FALSE}
+.x <- plot_data %>% select(matches(sample_names_re)) %>% as.matrix()
+.rdbu_ramp <- colorRampPalette(brewer.pal(11, "RdBu"))
+.col_side_colors <- as.matrix(tibble(
+    'control / zinc deficiency' = rep(c(rep('green', 24), rep('magenta', 24)), 1),
+    'control / acute / chronic' = rep(c(rep('yellow', 8), rep('black', 8), rep('blue', 8)), 2),
+))
+
+h <- heatmap.3(
+    x = .x,
+    main = paste(way, ' FDR < ', p_th, collapse = ''),
+    Rowv = TRUE,
+    Colv = FALSE,
+    dendrogram = 'row',
+    distfun = function(x) as.dist(1-cor(t(x))),
+    scale = "row",
+    col = rev(.rdbu_ramp(24)),
+    trace = "none",
+    ColSideColors = .col_side_colors,
+    ColSideColorsSize = 8,
+    key = FALSE,
+    lhei = c(1.5, 20),
+    labRow = pull(plot_data, gene_name),
+    cexRow = 1.2,
+    cexCol = 1.5,
+    offsetRow = 0,
+)
+```
+
+```{r}
+plot_data %>% pull(gene_name) %>% paste(collapse = '\n') %>% cat
+```
